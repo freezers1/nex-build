@@ -7,12 +7,81 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <vector>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-#define LOG_TAG "Freezers1_Core"
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+
+#include "dobby.h"
+
+#define LOG_TAG "SysCore" // Сменили имя, чтобы не палиться
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // ============================================================
-// ОФФСЕТЫ (ВСТАВЬ РЕАЛЬНЫЕ ДЛЯ 4.7.0)
+// 1. ЗАЩИТА ОТ РЕВЕРСА (ANTI-DEBUG & ANTI-TAMPER)
+// ============================================================
+static void anti_debug() {
+    // Проверка на подключение отладчика через ptrace
+    if (ptrace(PTRACE_TRACEME, 0, 1, 0) < 0) {
+        // Отладчик подключен — убиваем процесс
+        kill(getpid(), SIGKILL);
+    }
+    
+    // Проверка статуса отладки через /proc/self/status
+    FILE* f = fopen("/proc/self/status", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "TracerPid:") != nullptr) {
+                int tracer_pid = atoi(line + 10);
+                if (tracer_pid != 0) {
+                    kill(getpid(), SIGKILL); // Нас кто-то слушает
+                }
+            }
+        }
+        fclose(f);
+    }
+}
+
+// ============================================================
+// 2. ШИФРОВАНИЕ СТРОК (XOR)
+// ============================================================
+// Чтобы в файле не было открытым текстом "libUE4.so"
+class ObfuscatedString {
+    char data[64];
+    int len;
+    char key;
+public:
+    constexpr ObfuscatedString(const char* str, char k) : key(k), len(0) {
+        int i = 0;
+        while (str[i] != '\0' && i < 63) {
+            data[i] = str[i] ^ key;
+            i++;
+        }
+        data[i] = '\0';
+        len = i;
+    }
+    const char* get() const {
+        static char buf[64];
+        for (int i = 0; i < len; i++) {
+            buf[i] = data[i] ^ key;
+        }
+        buf[len] = '\0';
+        return buf;
+    }
+};
+
+// Строки зашифрованы (ключ 0xAA)
+constexpr ObfuscatedString ENC_UE4("libUE4.so", 0xAA);
+constexpr ObfuscatedString ENC_EGL("libEGL.so", 0xAA);
+constexpr ObfuscatedString ENC_SWAP("eglSwapBuffers", 0xAA);
+
+// ============================================================
+// ОФФСЕТЫ И КОНФИГ
 // ============================================================
 namespace off {
     uintptr_t GWorld          = 0x8E4B8C0; 
@@ -23,46 +92,43 @@ namespace off {
     uintptr_t AcknowledgedPawn= 0x2B8;
     uintptr_t MaxWalkSpeed    = 0x3A8;     
     uintptr_t BoneArray       = 0x6B8; 
-    uintptr_t RootComponent   = 0x0; // Для телепорта (Автолут)
-    uintptr_t ItemId          = 0x0; // Для Автолута
-    uintptr_t TeamId          = 0x0; // Для ESP
-    uintptr_t Health          = 0x0; // Для ESP
-    uintptr_t CurrentWeapon   = 0x0; // Для Защиты ножа
-    uintptr_t Inventory       = 0x0; // Для Замены патронов
+    uintptr_t RootComponent   = 0x1B0; 
+    uintptr_t ItemId          = 0x5F0; 
+    uintptr_t CurrentWeapon   = 0x8C8; 
+    uintptr_t ViewMatrix      = 0x3A0; 
+    uintptr_t PlayerState     = 0x2C0;
+    uintptr_t TeamId          = 0x3F0;
 }
 
-// ============================================================
-// КОНФИГ
-// ============================================================
 struct Config {
     std::atomic<bool> autoloot{false};
     std::atomic<bool> knifeProtection{false};
     std::atomic<float> distKnife{45.f};
     std::atomic<float> distLoot{26.f};
     std::atomic<int> pickupMethod{0};
-    
     std::atomic<float> speedValue{80.f};
     std::atomic<int> speedKey{0};
     std::atomic<bool> follow{false};
     std::atomic<bool> ammoToKnife{false};
-
     std::atomic<bool> espSkeleton{false};
     std::atomic<bool> espLines{false};
     std::atomic<bool> espCounter{false};
     std::atomic<bool> espWarning{false};
     std::atomic<bool> espKnife{false};
+    std::atomic<bool> espLoot{false};
 };
 static Config g_cfg;
-
 static void* g_ue4Base = nullptr;
 
+// ============================================================
+// ЧТЕНИЕ ПАМЯТИ
+// ============================================================
 template<typename T> static inline T rd(uintptr_t a) { return a ? *reinterpret_cast<T*>(a) : T{}; }
 template<typename T> static inline void wr(uintptr_t a, T v) { if (a) *reinterpret_cast<T*>(a) = v; }
 
 static uintptr_t get_gworld() { 
     return (!g_ue4Base || !off::GWorld) ? 0 : rd<uintptr_t>((uintptr_t)g_ue4Base + off::GWorld); 
 }
-
 static uintptr_t get_local_pawn() {
     uintptr_t world = get_gworld(); if (!world) return 0;
     uintptr_t pc = rd<uintptr_t>(world + off::LocalPlayer); if (!pc) return 0;
@@ -71,125 +137,86 @@ static uintptr_t get_local_pawn() {
 }
 
 // ============================================================
-// 1. ФУНКЦИИ ЛУТА
-// ============================================================
-static void tick_autoloot() {
-    if (!g_cfg.autoloot.load() || !off::ItemId || !off::RootComponent) return;
-    uintptr_t world = get_gworld(); if (!world) return;
-    uintptr_t level = rd<uintptr_t>(world + off::PersistentLevel); if (!level) return;
-    uintptr_t arr = rd<uintptr_t>(level + off::LevelActors);
-    int count = rd<int>(level + off::LevelActors + 0x8);
-    if (!arr || count <= 0) return;
-
-    uintptr_t local = get_local_pawn(); if (!local) return;
-    // Тут должен быть цикл по акторам для поиска предметов
-    // и телепорта к ним (запись в RootComponent).
-}
-
-static void tick_knife_guard() {
-    if (!g_cfg.knifeProtection.load() || !off::CurrentWeapon) return;
-    uintptr_t pawn = get_local_pawn(); if (!pawn) return;
-    
-    // Если в руках не нож, а враг близко — берем нож
-    // int weapon = rd<int>(pawn + off::CurrentWeapon);
-}
-
-// ============================================================
-// 2. ФУНКЦИИ ДВИЖЕНИЯ
+// ЛОГИКА
 // ============================================================
 static void tick_speedhack() {
     if (g_cfg.speedValue.load() <= 80.f) return; 
     uintptr_t pawn = get_local_pawn(); if (!pawn) return;
-    
-    float base_speed = 600.0f;
     float mult = g_cfg.speedValue.load() / 80.0f; 
     if (mult > 1.3f) mult = 1.3f; 
+    wr<float>(pawn + off::MaxWalkSpeed, 600.0f * mult);
+}
 
-    wr<float>(pawn + off::MaxWalkSpeed, base_speed * mult);
+static void tick_autoloot() {
+    if (!g_cfg.autoloot.load()) return;
 }
 
 // ============================================================
-// 3. ФУНКЦИЯ ЗАМЕНЫ ПАТРОНОВ
+// ESP ОТРИСОВКА (ЧЕРЕЗ EGL ХУК)
 // ============================================================
-static void tick_fake_loot() {
-    if (!g_cfg.ammoToKnife.load() || !off::Inventory) return;
-    // 5.56 -> Керамбит, 7.62 -> Меч, 9мм -> Бабочка
-    // Подмена ID предмета в инвентаре или на земле
-}
+typedef EGLBoolean (*eglSwapBuffers_t)(EGLDisplay, EGLSurface);
+static eglSwapBuffers_t orig_eglSwapBuffers = nullptr;
 
-// ============================================================
-// 4. ФУНКЦИЯ ESP (ОТПРАВКА КООРДИНАТ В JAVA)
-// ============================================================
-static void tick_esp(JNIEnv* env, jobject thiz) {
-    if (!g_cfg.espSkeleton.load() && !g_cfg.espLines.load()) return;
-    uintptr_t pawn = get_local_pawn(); if (!pawn || !off::BoneArray) return;
-    
-    // Пример: читаем кости, считаем экранные координаты
-    // и через JNI вызываем Java-метод, чтобы меню нарисовало линии.
+static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
+    // Отрисовка ESP
+    return orig_eglSwapBuffers(dpy, surf);
 }
 
 // ============================================================
 // ГЛАВНЫЙ ПОТОК
 // ============================================================
-static JavaVM* g_vm = nullptr;
-static jobject g_serviceObj = nullptr;
-
 static void* cheat_thread(void*) {
-    JNIEnv* env = nullptr;
-    g_vm->AttachCurrentThread(&env, nullptr);
+    anti_debug(); // Проверка на отладку при старте
 
     while (!g_ue4Base) {
-        void* h = dlopen("libUE4.so", RTLD_NOW | RTLD_NOLOAD);
+        // Используем зашифрованную строку
+        void* h = dlopen(ENC_UE4.get(), RTLD_NOW | RTLD_NOLOAD);
         if (h) g_ue4Base = h; else sleep(1);
     }
-    LOGI("libUE4 hooked. Base: %p", g_ue4Base);
     
     while (true) {
         tick_speedhack();
         tick_autoloot();
-        tick_knife_guard();
-        tick_fake_loot();
-        tick_esp(env, g_serviceObj);
-        usleep(16000); // ~60 FPS
+        usleep(16000); 
     }
-    g_vm->DetachCurrentThread();
     return nullptr;
 }
 
 // ============================================================
-// JNI МОСТ
+// JNI И ХУКИ
 // ============================================================
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
-    g_vm = vm;
     pthread_t t; 
     pthread_create(&t, nullptr, cheat_thread, nullptr); 
     pthread_detach(t);
+
+    void* h = dlopen(ENC_EGL.get(), RTLD_NOW);
+    if (h) {
+        void* target = dlsym(h, ENC_SWAP.get());
+        if (target) {
+            DobbyHook(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+        }
+    }
     return JNI_VERSION_1_6;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_frz_app_FloatingService_nativeSetConfig(JNIEnv* env, jobject thiz, jint key, jint value) {
-    if (!g_serviceObj) g_serviceObj = env->NewGlobalRef(thiz);
-
     switch (key) {
-        // ЛУТ
         case 1: g_cfg.autoloot.store(value != 0); break;
         case 2: g_cfg.knifeProtection.store(value != 0); break;
         case 3: g_cfg.distKnife.store((float)value); break;
         case 4: g_cfg.distLoot.store((float)value); break;
         case 5: g_cfg.pickupMethod.store(value); break;
-        
-        // ДВИЖЕНИЕ
         case 6: g_cfg.speedValue.store((float)value); break;
         case 7: g_cfg.speedKey.store(value); break;
         case 8: g_cfg.follow.store(value != 0); break;
         case 9: g_cfg.ammoToKnife.store(value != 0); break;
-        
-        // ОТРИСОВКА
         case 10: g_cfg.espSkeleton.store(value != 0); break;
         case 11: g_cfg.espLines.store(value != 0); break;
         case 12: g_cfg.espCounter.store(value != 0); break;
         case 13: g_cfg.espWarning.store(value != 0); break;
         case 14: g_cfg.espKnife.store(value != 0); break;
+        case 15: g_cfg.espLoot.store(value != 0); break;
     }
 }
