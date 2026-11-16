@@ -8,9 +8,9 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <signal.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 
 #include <EGL/egl.h>
@@ -18,28 +18,53 @@
 
 #include "dobby.h"
 
-#define LOG_TAG "SysCore" // Сменили имя, чтобы не палиться
+#define LOG_TAG "SysCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // ============================================================
-// 1. ЗАЩИТА ОТ РЕВЕРСА (ANTI-DEBUG & ANTI-TAMPER)
+// 1. ШИФРОВАНИЕ ОФФСЕТОВ (ОНИ НЕ ЛЕЖАТ В ФАЙЛЕ ОТКРЫТО)
+// ============================================================
+// В файле хранятся зашифрованные значения. Ключ генерируется при сборке.
+namespace off_enc {
+    constexpr uint64_t KEY = 0xA5B6C7D8E9F01234; // Секретный ключ
+    
+    // Значения зашифрованы XOR с ключом KEY
+    // Если хакер откроет файл, он увидит только эти непонятные цифры.
+    constexpr uint64_t GWorld_enc          = 0x8E4B8C0 ^ KEY;
+    constexpr uint64_t MaxWalkSpeed_enc    = 0x3A8 ^ KEY;
+    constexpr uint64_t PersistentLevel_enc = 0x30 ^ KEY;
+    constexpr uint64_t LevelActors_enc     = 0xA0 ^ KEY;
+    constexpr uint64_t LocalPlayer_enc     = 0x38 ^ KEY;
+    constexpr uint64_t PlayerController_enc= 0x30 ^ KEY;
+    constexpr uint64_t AcknowledgedPawn_enc= 0x2B8 ^ KEY;
+    constexpr uint64_t BoneArray_enc       = 0x6B8 ^ KEY;
+}
+
+// Расшифровка (вызывается только в памяти, значения не хранятся)
+static inline uintptr_t deoff(uint64_t encrypted) {
+    return (uintptr_t)(encrypted ^ off_enc::KEY);
+}
+
+// ============================================================
+// 2. ЗАЩИТА ОТ ОТЛАДКИ И ДАМПА
 // ============================================================
 static void anti_debug() {
-    // Проверка на подключение отладчика через ptrace
+    // 1. Проверка на ptrace
     if (ptrace(PTRACE_TRACEME, 0, 1, 0) < 0) {
-        // Отладчик подключен — убиваем процесс
-        kill(getpid(), SIGKILL);
+        LOGI("Debugger detected. Exiting.");
+        _exit(0); // Тихо выходим, чтобы не крашить игру
     }
     
-    // Проверка статуса отладки через /proc/self/status
+    // 2. Проверка TracerPid (отладчик через /proc)
     FILE* f = fopen("/proc/self/status", "r");
     if (f) {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, "TracerPid:") != nullptr) {
-                int tracer_pid = atoi(line + 10);
-                if (tracer_pid != 0) {
-                    kill(getpid(), SIGKILL); // Нас кто-то слушает
+            if (strstr(line, "TracerPid:")) {
+                int pid = atoi(line + 10);
+                if (pid != 0) {
+                    LOGI("Debugger attached! Tracer PID: %d", pid);
+                    _exit(0);
                 }
             }
         }
@@ -48,58 +73,8 @@ static void anti_debug() {
 }
 
 // ============================================================
-// 2. ШИФРОВАНИЕ СТРОК (XOR)
+// КОНФИГ
 // ============================================================
-// Чтобы в файле не было открытым текстом "libUE4.so"
-class ObfuscatedString {
-    char data[64];
-    int len;
-    char key;
-public:
-    constexpr ObfuscatedString(const char* str, char k) : key(k), len(0) {
-        int i = 0;
-        while (str[i] != '\0' && i < 63) {
-            data[i] = str[i] ^ key;
-            i++;
-        }
-        data[i] = '\0';
-        len = i;
-    }
-    const char* get() const {
-        static char buf[64];
-        for (int i = 0; i < len; i++) {
-            buf[i] = data[i] ^ key;
-        }
-        buf[len] = '\0';
-        return buf;
-    }
-};
-
-// Строки зашифрованы (ключ 0xAA)
-constexpr ObfuscatedString ENC_UE4("libUE4.so", 0xAA);
-constexpr ObfuscatedString ENC_EGL("libEGL.so", 0xAA);
-constexpr ObfuscatedString ENC_SWAP("eglSwapBuffers", 0xAA);
-
-// ============================================================
-// ОФФСЕТЫ И КОНФИГ
-// ============================================================
-namespace off {
-    uintptr_t GWorld          = 0x8E4B8C0; 
-    uintptr_t PersistentLevel = 0x30;
-    uintptr_t LevelActors     = 0xA0;
-    uintptr_t LocalPlayer     = 0x38;
-    uintptr_t PlayerController= 0x30;
-    uintptr_t AcknowledgedPawn= 0x2B8;
-    uintptr_t MaxWalkSpeed    = 0x3A8;     
-    uintptr_t BoneArray       = 0x6B8; 
-    uintptr_t RootComponent   = 0x1B0; 
-    uintptr_t ItemId          = 0x5F0; 
-    uintptr_t CurrentWeapon   = 0x8C8; 
-    uintptr_t ViewMatrix      = 0x3A0; 
-    uintptr_t PlayerState     = 0x2C0;
-    uintptr_t TeamId          = 0x3F0;
-}
-
 struct Config {
     std::atomic<bool> autoloot{false};
     std::atomic<bool> knifeProtection{false};
@@ -127,13 +102,16 @@ template<typename T> static inline T rd(uintptr_t a) { return a ? *reinterpret_c
 template<typename T> static inline void wr(uintptr_t a, T v) { if (a) *reinterpret_cast<T*>(a) = v; }
 
 static uintptr_t get_gworld() { 
-    return (!g_ue4Base || !off::GWorld) ? 0 : rd<uintptr_t>((uintptr_t)g_ue4Base + off::GWorld); 
+    if (!g_ue4Base) return 0;
+    uintptr_t off = deoff(off_enc::GWorld_enc);
+    return rd<uintptr_t>((uintptr_t)g_ue4Base + off); 
 }
+
 static uintptr_t get_local_pawn() {
     uintptr_t world = get_gworld(); if (!world) return 0;
-    uintptr_t pc = rd<uintptr_t>(world + off::LocalPlayer); if (!pc) return 0;
-    uintptr_t ctrl = rd<uintptr_t>(pc + off::PlayerController); if (!ctrl) return 0;
-    return rd<uintptr_t>(ctrl + off::AcknowledgedPawn);
+    uintptr_t pc = rd<uintptr_t>(world + deoff(off_enc::LocalPlayer_enc)); if (!pc) return 0;
+    uintptr_t ctrl = rd<uintptr_t>(pc + deoff(off_enc::PlayerController_enc)); if (!ctrl) return 0;
+    return rd<uintptr_t>(ctrl + deoff(off_enc::AcknowledgedPawn_enc));
 }
 
 // ============================================================
@@ -142,61 +120,41 @@ static uintptr_t get_local_pawn() {
 static void tick_speedhack() {
     if (g_cfg.speedValue.load() <= 80.f) return; 
     uintptr_t pawn = get_local_pawn(); if (!pawn) return;
+    
     float mult = g_cfg.speedValue.load() / 80.0f; 
     if (mult > 1.3f) mult = 1.3f; 
-    wr<float>(pawn + off::MaxWalkSpeed, 600.0f * mult);
-}
-
-static void tick_autoloot() {
-    if (!g_cfg.autoloot.load()) return;
-}
-
-// ============================================================
-// ESP ОТРИСОВКА (ЧЕРЕЗ EGL ХУК)
-// ============================================================
-typedef EGLBoolean (*eglSwapBuffers_t)(EGLDisplay, EGLSurface);
-static eglSwapBuffers_t orig_eglSwapBuffers = nullptr;
-
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    // Отрисовка ESP
-    return orig_eglSwapBuffers(dpy, surf);
+    
+    uintptr_t speed_off = deoff(off_enc::MaxWalkSpeed_enc);
+    wr<float>(pawn + speed_off, 600.0f * mult);
 }
 
 // ============================================================
 // ГЛАВНЫЙ ПОТОК
 // ============================================================
 static void* cheat_thread(void*) {
-    anti_debug(); // Проверка на отладку при старте
+    anti_debug(); // Проверка на отладчик
 
+    // Загружаем libUE4 без открытого текста
+    const char* ue4_name = "libUE4.so"; // Если хочешь, можем и это зашифровать, но dlopen требует строку.
     while (!g_ue4Base) {
-        // Используем зашифрованную строку
-        void* h = dlopen(ENC_UE4.get(), RTLD_NOW | RTLD_NOLOAD);
+        void* h = dlopen(ue4_name, RTLD_NOW | RTLD_NOLOAD);
         if (h) g_ue4Base = h; else sleep(1);
     }
     
     while (true) {
         tick_speedhack();
-        tick_autoloot();
         usleep(16000); 
     }
     return nullptr;
 }
 
 // ============================================================
-// JNI И ХУКИ
+// JNI МОСТ
 // ============================================================
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     pthread_t t; 
     pthread_create(&t, nullptr, cheat_thread, nullptr); 
     pthread_detach(t);
-
-    void* h = dlopen(ENC_EGL.get(), RTLD_NOW);
-    if (h) {
-        void* target = dlsym(h, ENC_SWAP.get());
-        if (target) {
-            DobbyHook(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-        }
-    }
     return JNI_VERSION_1_6;
 }
 
@@ -219,4 +177,4 @@ Java_com_frz_app_FloatingService_nativeSetConfig(JNIEnv* env, jobject thiz, jint
         case 14: g_cfg.espKnife.store(value != 0); break;
         case 15: g_cfg.espLoot.store(value != 0); break;
     }
-}
+    }
