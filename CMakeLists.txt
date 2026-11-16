@@ -4,7 +4,7 @@ project(Native)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Автоматическая загрузка Dobby прямо с GitHub
+# Автоматическая загрузка Dobby
 include(FetchContent)
 FetchContent_Declare(
   dobby
@@ -13,8 +13,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(dobby)
 
+# Наша библиотека
 add_library(Native SHARED main.cpp)
 
+# Линкуем Dobby и системные библиотеки
 target_link_libraries(Native 
     dobby
     android 
