@@ -4,14 +4,17 @@ project(Native)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Подключаем Dobby (хуки)
-add_subdirectory(third_party/dobby)
-include_directories(third_party/dobby/include)
+# Автоматическая загрузка Dobby прямо с GitHub
+include(FetchContent)
+FetchContent_Declare(
+  dobby
+  GIT_REPOSITORY https://github.com/jmpews/Dobby.git
+  GIT_TAG        master
+)
+FetchContent_MakeAvailable(dobby)
 
-# Собираем нашу библиотеку
 add_library(Native SHARED main.cpp)
 
-# Линкуем Dobby и системные библиотеки Android
 target_link_libraries(Native 
     dobby
     android 
