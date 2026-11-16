@@ -4,7 +4,11 @@ project(Native)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Автоматическая загрузка Dobby
+# Отключаем сборку ассемблерных файлов Dobby для ARM64 (чтобы GitHub не падал)
+set(DOBBY_BUILD_EXAMPLES OFF CACHE BOOL "")
+set(DOBBY_BUILD_TESTS OFF CACHE BOOL "")
+set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "")
+
 include(FetchContent)
 FetchContent_Declare(
   dobby
@@ -13,10 +17,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(dobby)
 
-# Наша библиотека
 add_library(Native SHARED main.cpp)
 
-# Линкуем Dobby и системные библиотеки
 target_link_libraries(Native 
     dobby
     android 
